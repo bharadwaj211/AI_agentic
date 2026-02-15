@@ -14,7 +14,7 @@ if not os.getenv("OPENAI_API_KEY"):
 llm = ChatOpenAI(
     model="gpt-4o-mini",
     temperature=0,
-    max_completion_tokens=100
+    max_completion_tokens=300
 )
 
 # Defining the shared states
@@ -47,7 +47,7 @@ def writer_agent(state: ReviewState):
 
 # Node 2: Reviewer agent
 def reviewer_agent(state: ReviewState):
-    print(f"\n🔍 Reviewer Agent reviewing... (Attempt {state['review_count'] + 1})\n")
+    print(f"\n Reviewer Agent reviewing... (Attempt {state['review_count'] + 1})\n")
 
     prompt = f"""
     Evaluate the following content for:

@@ -5,7 +5,7 @@ from langgraph.graph import StateGraph, END
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage
 
-# Load the environment variables from the file present in this folder
+# Load the environment variables from the env file 
 load_dotenv()
 
 # Implementing the check here to see whether it is picking up the env file or

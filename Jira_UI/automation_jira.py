@@ -3,7 +3,8 @@ import json
 import requests
 import subprocess
 import xml.etree.ElementTree as ET
-import time
+import uuid
+from datetime import datetime
 from typing import Annotated, List
 from typing_extensions import TypedDict
 
@@ -12,44 +13,49 @@ from langchain_core.tools import tool
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from langgraph.graph import StateGraph, add_messages
 from langgraph.prebuilt import ToolNode, tools_condition
+from langgraph.checkpoint.memory import MemorySaver
 from dotenv import load_dotenv
 
 # =========================
 # Configuration & Env
 # =========================
 load_dotenv()
-JIRA_BASE_URL = os.getenv("JIRA_BASE_URL").rstrip('/')
+
+JIRA_BASE_URL = os.getenv("JIRA_BASE_URL", "").rstrip('/')
 JIRA_EMAIL = os.getenv("JIRA_EMAIL")
 JIRA_API_TOKEN = os.getenv("JIRA_API_TOKEN")
 OPEN_API_KEY = os.getenv("OPEN_API_KEY")
-ROBOT_TEST_PATH = os.getenv("ROBOT_TEST_PATH", "tests/")
+ROBOT_TEST_PATH = os.getenv("ROBOT_TEST_PATH")
 ROBOT_OUTPUT_DIR = os.getenv("ROBOT_OUTPUT_DIR", "results")
 
 CACHE_FILE = "jira_automation_cache.json"
+HISTORY_LOG = "automation_history.log"
 
 # =================================
-# Local Cache Helpers
+# Helper Functions
 # =================================
+
+def log_history(message):
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with open(HISTORY_LOG, "a") as f:
+        f.write(f"[{timestamp}] {message}\n")
+
 def get_cached_ticket():
     if os.path.exists(CACHE_FILE):
-        try:
-            with open(CACHE_FILE, "r") as f:
-                return json.load(f).get("issue_key")
-        except: return None
+        with open(CACHE_FILE, "r") as f:
+            try: return json.load(f).get("issue_key")
+            except: return None
     return None
 
 def save_cached_ticket(issue_key):
     with open(CACHE_FILE, "w") as f:
         json.dump({"issue_key": issue_key}, f)
 
-# =================================
-# Jira REST Helpers
-# =================================
-def jira_request(method, endpoint, payload=None, params=None):
+def jira_request(method, endpoint, payload=None):
     url = f"{JIRA_BASE_URL}/rest/api/3/{endpoint.lstrip('/')}"
     auth = (JIRA_EMAIL, JIRA_API_TOKEN)
     headers = {"Accept": "application/json", "Content-Type": "application/json"}
-    return requests.request(method, url, headers=headers, auth=auth, params=params, json=payload, timeout=20)
+    return requests.request(method, url, headers=headers, auth=auth, json=payload, timeout=20)
 
 def transition_issue(issue_key, target_name):
     res = jira_request("GET", f"issue/{issue_key}/transitions")
@@ -61,83 +67,77 @@ def transition_issue(issue_key, target_name):
         return True
     return False
 
+def find_all_failures(element, failures_list):
+    if element is None: return
+    for test in element.findall("test"):
+        status = test.find("status")
+        if status is not None and status.attrib.get("status") == "FAIL":
+            failures_list.append({"name": test.attrib.get("name"), "message": status.text})
+    for suite in element.findall("suite"):
+        find_all_failures(suite, failures_list)
+
+def analyze_failures_with_ai(failure_text):
+    analysis_llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, api_key=OPEN_API_KEY)
+    prompt = f"Analyze these Robot Framework failures and explain the root cause concisely:\n\n{failure_text}"
+    response = analysis_llm.invoke([HumanMessage(content=prompt)])
+    return response.content
+
 # ==============================
-# The Automation Tool
+# Tools
 # ==============================
 
 @tool
+def clear_session_command():
+    """Resets the AI's internal state so it can run tests again."""
+    if os.path.exists(HISTORY_LOG):
+        os.remove(HISTORY_LOG)
+    return "Memory reset. I am ready for a fresh command."
+
+@tool
 def run_robot_automation(project_key: str = "SCRUM"):
-    """
-    Executes Robot tests and manages Jira tickets via Local Cache.
-    Bypasses Jira Search Indexing completely to prevent duplicates.
-    """
+    """Runs tests, updates Jira (closes on pass), and analyzes failures."""
     os.makedirs(ROBOT_OUTPUT_DIR, exist_ok=True)
-    
-    print(f"\n[System]: Running Robot Framework tests...")
+    log_history("AI Agent running: Initiating automation...")
+
     subprocess.run(["robot", "--outputdir", ROBOT_OUTPUT_DIR, ROBOT_TEST_PATH], capture_output=True)
 
     output_file = os.path.join(ROBOT_OUTPUT_DIR, "output.xml")
-    if not os.path.exists(output_file): return "Error: output.xml not found."
+    if not os.path.exists(output_file):
+        return "Error: output.xml not found."
 
-    root = ET.parse(output_file).getroot()
+    tree = ET.parse(output_file)
+    root = tree.getroot()
     stat = root.find(".//total/stat")
     passed, failed = int(stat.attrib.get("pass", 0)), int(stat.attrib.get("fail", 0))
 
-    # Parse errors
-    failed_details = []
-    for test in root.findall(".//test"):
-        status_tag = test.find("status")
-        if status_tag is not None and status_tag.attrib.get("status") == "FAIL":
-            failed_details.append(f"* Test Case:* {test.attrib.get('name')}\n*Reason:* {status_tag.text}")
+    failures = []
+    find_all_failures(root.find("suite"), failures)
+    raw_failure_text = "\n".join([f"Test: {f['name']} | Error: {f['message']}" for f in failures])
     
-    report_body = f"Passed: {passed}, Failed: {failed}\n\n*Failed Details:*\n" + "\n".join(failed_details)
-
-    # --- THE CACHE CHECK (No JQL Search) ---
-    print("[System]: Checking local cache for existing ticket...")
+    ai_explanation = analyze_failures_with_ai(raw_failure_text) if failed > 0 else "All tests passed."
     existing_key = get_cached_ticket()
-    is_active_in_jira = False
-
-    if existing_key:
-        # Ask Jira specifically about THIS ticket key (Direct DB hit)
-        res = jira_request("GET", f"issue/{existing_key}")
-        if res.status_code == 200:
-            status_cat = res.json()["fields"]["status"]["statusCategory"]["name"]
-            # Only consider it "active" if it isn't in a 'Done' category
-            if status_cat != "Done":
-                is_active_in_jira = True
-        else:
-            existing_key = None # Ticket likely deleted
+    jira_status = "No update needed."
 
     if failed > 0:
-        if is_active_in_jira:
-            # Add a comment to the existing ticket
-            payload = {"body": {"type": "doc", "version": 1, "content": [{"type": "paragraph", "content": [{"type": "text", "text": f"Automation Re-run Results:\n{report_body}"}]}]}}
-            jira_request("POST", f"issue/{existing_key}/comment", payload)
-            return f"Tests Failed ({failed}). Updated existing ticket {existing_key}. WORKFLOW COMPLETE."
+        comment_body = f"AI ANALYSIS: {ai_explanation}\n\nRAW FAILURES:\n{raw_failure_text}"
+        if existing_key:
+            jira_request("POST", f"issue/{existing_key}/comment", {"body": {"type": "doc", "version": 1, "content": [{"type": "paragraph", "content": [{"type": "text", "text": comment_body}]}]}})
+            jira_status = f"Updated existing Jira ticket: {existing_key}"
         else:
-            # Create a brand new ticket
-            payload = {
-                "fields": {
-                    "project": {"key": project_key},
-                    "summary": f"Automation Failure in {project_key}",
-                    "description": {"type": "doc", "version": 1, "content": [{"type": "paragraph", "content": [{"type": "text", "text": report_body}]}]},
-                    "issuetype": {"name": "Bug"},
-                    "labels": ["automation_failure"]
-                }
-            }
+            payload = {"fields": {"project": {"key": project_key}, "summary": f"Automation Failure: {project_key}", "description": {"type": "doc", "version": 1, "content": [{"type": "paragraph", "content": [{"type": "text", "text": comment_body}]}]}, "issuetype": {"name": "Bug"}, "labels": ["automation_failure"]}}
             res = jira_request("POST", "issue", payload)
             if res.status_code == 201:
-                new_key = res.json().get('key')
-                save_cached_ticket(new_key) # Update cache with new key
-                transition_issue(new_key, "progress")
-                return f"Tests Failed ({failed}). Created {new_key} and set to IN PROGRESS. WORKFLOW COMPLETE."
-            return f"Error creating ticket: {res.text}"
+                existing_key = res.json().get("key")
+                save_cached_ticket(existing_key)
+                transition_issue(existing_key, "progress")
+                jira_status = f"Created new Jira Bug: {existing_key}"
     else:
-        # All passed
-        if is_active_in_jira:
+        if existing_key:
             transition_issue(existing_key, "done")
-            return f"All tests passed! Closed existing ticket {existing_key}. WORKFLOW COMPLETE."
-        return "All tests passed. No active tickets found. WORKFLOW COMPLETE."
+            jira_status = f"Tests Passed. Closed ticket: {existing_key}"
+            if os.path.exists(CACHE_FILE): os.remove(CACHE_FILE)
+
+    return f"AI Agent running...\nRESULTS: {passed} Passed, {failed} Failed.\nJIRA: {jira_status}\nANALYSIS: {ai_explanation}"
 
 # =================================
 # Agent Setup
@@ -146,37 +146,55 @@ def run_robot_automation(project_key: str = "SCRUM"):
 class State(TypedDict):
     messages: Annotated[List[BaseMessage], add_messages]
 
-tools = [run_robot_automation]
+tools = [run_robot_automation, clear_session_command]
 tool_node = ToolNode(tools)
 llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, api_key=OPEN_API_KEY).bind_tools(tools)
 
-SYSTEM_PROMPT = SystemMessage(content=(
-    "You are a QA Agent. Run tests with 'run_robot_automation'. "
-    "The tool handles all Jira logic. Once 'WORKFLOW COMPLETE' is returned, "
-    "summarize and stop. Do not repeat the run."
-))
+SYSTEM_PROMPT = SystemMessage(content="You are a Senior QA AI. Always report the Jira ticket status clearly.")
 
 def call_model(state: State):
     return {"messages": [llm.invoke([SYSTEM_PROMPT] + state["messages"])]}
 
+memory = MemorySaver()
 builder = StateGraph(State)
 builder.add_node("agent", call_model)
 builder.add_node("tools", tool_node)
 builder.set_entry_point("agent")
 builder.add_conditional_edges("agent", tools_condition)
 builder.add_edge("tools", "agent")
-graph = builder.compile()
+graph = builder.compile(checkpointer=memory)
+
+# =================================
+# Main Execution Loop
+# =================================
 
 def main():
-    print("SMART-QA agent Online (Zero-Index Cache Mode).\n")
+    # Initialize a unique session ID
+    session_id = str(uuid.uuid4())
+    print(f"SMART-QA Agent Active. [Session ID: {session_id[:8]}]\n")
+    
     while True:
-        u = input("End-user: ").strip()
-        if u.lower() in ["exit", "quit"]: break
-        for event in graph.stream({"messages": [HumanMessage(content=u)]}, stream_mode="values"):
+        user_input = input("USER: ")
+        
+        if user_input.lower() in ["exit", "quit"]:
+            break
+
+        # Check for clear session command
+        if user_input.lower() == "clear session":
+            session_id = str(uuid.uuid4()) # Generate NEW thread_id to reset AI brain
+            print(f"\n[AI]: Session cleared. Memory reset. (New Session: {session_id[:8]})\n")
+            continue
+
+        config = {"configurable": {"thread_id": session_id}}
+        events = graph.stream({"messages": [HumanMessage(content=user_input)]}, config, stream_mode="values")
+        
+        for event in events:
             if "messages" in event:
-                m = event["messages"][-1]
-                if m.type == "ai" and m.content: print(f"AI-Agent: {m.content}")
-                elif m.type == "tool": print(f"\n[Tool Result]: {m.content}\n")
+                msg = event["messages"][-1]
+                if msg.type == "ai" and msg.content:
+                    print(f"\n[AI]: {msg.content}")
+                elif msg.type == "tool":
+                    print(f"\n[TOOL]: {msg.content}")
 
 if __name__ == "__main__":
     main()

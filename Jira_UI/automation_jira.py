@@ -95,7 +95,7 @@ def clear_session_command():
 
 @tool
 def run_robot_automation(project_key: str = "SCRUM"):
-    """Runs tests, updates Jira (closes on pass), and analyzes failures."""
+    """Runs Robot Framework tests, updates Jira tickets, and performs initial failure analysis."""
     os.makedirs(ROBOT_OUTPUT_DIR, exist_ok=True)
     log_history("AI Agent running: Initiating automation...")
 
@@ -137,7 +137,7 @@ def run_robot_automation(project_key: str = "SCRUM"):
             jira_status = f"Tests Passed. Closed ticket: {existing_key}"
             if os.path.exists(CACHE_FILE): os.remove(CACHE_FILE)
 
-    return f"AI Agent running...\nRESULTS: {passed} Passed, {failed} Failed.\nJIRA: {jira_status}\nANALYSIS: {ai_explanation}"
+    return f"RESULTS: {passed} Passed, {failed} Failed.\nJIRA: {jira_status}\nRAW FAILURE DATA: {raw_failure_text}\nAI SUMMARY: {ai_explanation}"
 
 # =================================
 # Agent Setup
@@ -150,7 +150,16 @@ tools = [run_robot_automation, clear_session_command]
 tool_node = ToolNode(tools)
 llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, api_key=OPEN_API_KEY).bind_tools(tools)
 
-SYSTEM_PROMPT = SystemMessage(content="You are a Senior QA AI. Always report the Jira ticket status clearly.")
+# Updated System Prompt for Conversational Troubleshooting
+SYSTEM_PROMPT = SystemMessage(content=(
+    "You are a Senior QA Automation Expert. "
+    "1. Use 'run_robot_automation' ONLY when the user explicitly asks to run tests. "
+    "2. If tests have already been run in this session, use the 'RAW FAILURE DATA' from the chat history "
+    "to answer follow-up questions like 'why did it fail?' or 'how do I fix this?'. "
+    "3. DO NOT re-run the automation if the failure data is already visible in the history. "
+    "4. Provide detailed technical solutions, code suggestions, and troubleshooting steps. "
+    "5. Always report the Jira ticket status clearly."
+))
 
 def call_model(state: State):
     return {"messages": [llm.invoke([SYSTEM_PROMPT] + state["messages"])]}
@@ -169,9 +178,8 @@ graph = builder.compile(checkpointer=memory)
 # =================================
 
 def main():
-    # Initialize a unique session ID
     session_id = str(uuid.uuid4())
-    print(f"SMART-QA Agent Active. [Session ID: {session_id[:8]}]\n")
+    print(f"SMART-QA agent active. [Session ID: {session_id[:8]}]\n")
     
     while True:
         user_input = input("USER: ")
@@ -179,22 +187,24 @@ def main():
         if user_input.lower() in ["exit", "quit"]:
             break
 
-        # Check for clear session command
         if user_input.lower() == "clear session":
-            session_id = str(uuid.uuid4()) # Generate NEW thread_id to reset AI brain
-            print(f"\n[AI]: Session cleared. Memory reset. (New Session: {session_id[:8]})\n")
+            session_id = str(uuid.uuid4())
+            print(f"\n[AI]: Session cleared. (New Session: {session_id[:8]})\n")
             continue
 
         config = {"configurable": {"thread_id": session_id}}
+        
+        # We stream the values so the AI can see its own tool outputs in the message history
         events = graph.stream({"messages": [HumanMessage(content=user_input)]}, config, stream_mode="values")
         
         for event in events:
             if "messages" in event:
                 msg = event["messages"][-1]
+                # Only print the final AI response to the user for a clean conversation
                 if msg.type == "ai" and msg.content:
-                    print(f"\n[AI]: {msg.content}")
+                    print(f"\n[AI]: {msg.content}\n")
                 elif msg.type == "tool":
-                    print(f"\n[TOOL]: {msg.content}")
+                    print(f"\n[SYSTEM]: Processing tool results...\n")
 
 if __name__ == "__main__":
     main()
